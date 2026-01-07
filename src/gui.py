@@ -2,8 +2,9 @@ import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 import threading
 import sys
+import os
 from .logic import FreightBatchProcessor
-from .utils import logger
+from .utils import logger, open_directory
 
 class TextRedirector(object):
     def __init__(self, widget, tag="stdout"):
@@ -22,8 +23,11 @@ class TextRedirector(object):
 class MainWindow:
     def __init__(self, root):
         self.root = root
-        self.root.title("孔夫子旧书网 - 批量修改运费模板工具")
+        self.root.title("孔网 - 批量修改商品运费模板工具")
         self.root.geometry("900x600")
+        
+        # 强制固定界面颜色，防止随系统主题切换
+        self.setup_fixed_theme()
         
         # 变量
         self.csv_path = tk.StringVar()
@@ -36,6 +40,27 @@ class MainWindow:
         
         # 初始日志
         logger.info("程序启动。请选择模板文件并输入账号信息。")
+
+    def setup_fixed_theme(self):
+        """配置固定的 UI 主题颜色"""
+        bg_color = "#f0f0f0"
+        fg_color = "#333333"
+        
+        self.root.configure(bg=bg_color)
+        style = ttk.Style()
+        
+        # 使用 'clam' 主题，因为它在跨平台时表现较为一致，不强制依赖系统原生主题色
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+            
+        style.configure(".", background=bg_color, foreground=fg_color)
+        style.configure("TLabel", background=bg_color, foreground=fg_color)
+        style.configure("TLabelframe", background=bg_color, foreground=fg_color)
+        style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
+        style.configure("TEntry", fieldbackground="white", foreground="black")
+        style.configure("TButton", background="#e1e1e1", foreground="black", padding=5)
+        style.map("TButton", background=[("active", "#cccccc")])
+        style.configure("TSeparator", background="#cccccc")
 
     def setup_ui(self):
         # 顶部操作区
@@ -65,23 +90,31 @@ class MainWindow:
         self.btn_stop = ttk.Button(frame_btn, text="停止", command=self.stop_task, state="disabled")
         self.btn_stop.pack(side="left", padx=5)
         
+        ttk.Separator(frame_btn, orient="vertical").pack(side="left", fill="y", padx=10)
+        
+        self.btn_open_output = ttk.Button(frame_btn, text="打开输出目录", command=self.open_output_dir)
+        self.btn_open_output.pack(side="left", padx=5)
+        self.btn_open_logs = ttk.Button(frame_btn, text="打开日志目录", command=self.open_logs_dir)
+        self.btn_open_logs.pack(side="left", padx=5)
+        
         # 日志区
         frame_log = ttk.LabelFrame(self.root, text="运行日志", padding="10")
         frame_log.pack(fill="both", expand=True, padx=10, pady=5)
         
-        self.txt_log = scrolledtext.ScrolledText(frame_log, state='disabled')
+        self.txt_log = scrolledtext.ScrolledText(frame_log, state='disabled', bg="white", fg="black", insertbackground="black")
         self.txt_log.pack(fill="both", expand=True)
         
-        # 重定向 stdout/stderr 到日志窗口 (可选，但由于我们用了 logger，主要靠 log_callback)
-        # sys.stdout = TextRedirector(self.txt_log, "stdout")
-        # sys.stderr = TextRedirector(self.txt_log, "stderr")
+        # 配置日志颜色标签
+        self.txt_log.tag_config("INFO", foreground="black")
+        self.txt_log.tag_config("WARNING", foreground="orange")
+        self.txt_log.tag_config("ERROR", foreground="red")
 
-    def log_to_ui(self, message):
-        self.root.after(0, self._append_log, message)
+    def log_to_ui(self, message, level="INFO"):
+        self.root.after(0, self._append_log, message, level)
 
-    def _append_log(self, message):
+    def _append_log(self, message, level="INFO"):
         self.txt_log.configure(state="normal")
-        self.txt_log.insert("end", message + "\n")
+        self.txt_log.insert("end", message + "\n", (level,))
         self.txt_log.see("end")
         self.txt_log.configure(state="disabled")
 
@@ -89,6 +122,16 @@ class MainWindow:
         filename = filedialog.askopenfilename(filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")])
         if filename:
             self.csv_path.set(filename)
+
+    def open_output_dir(self):
+        success, msg = open_directory("output")
+        if not success:
+            messagebox.showerror("错误", f"无法打开目录: {msg}")
+
+    def open_logs_dir(self):
+        success, msg = open_directory("logs")
+        if not success:
+            messagebox.showerror("错误", f"无法打开目录: {msg}")
 
     def start_task(self):
         csv_file = self.csv_path.get()
@@ -115,14 +158,14 @@ class MainWindow:
     def stop_task(self):
         if self.is_running:
             self.processor.stop()
-            self.log_to_ui("正在停止任务...")
+            self.log_to_ui("正在停止任务...", "WARNING")
             self.btn_stop.config(state="disabled")
 
     def run_thread(self, csv_file, user, pwd):
         try:
             self.processor.run(csv_file, user, pwd)
         except Exception as e:
-            self.log_to_ui(f"发生未捕获异常: {e}")
+            self.log_to_ui(f"发生未捕获异常: {e}", "ERROR")
             logger.exception("Run loop error")
         finally:
             self.is_running = False
@@ -131,4 +174,4 @@ class MainWindow:
     def task_finished(self):
         self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
-        messagebox.showinfo("完成", "任务运行结束，请查看日志和结果文件。")
+        messagebox.showinfo("完成", "任务运行完成，请查看界面运行日志，注意红色错误信息。")

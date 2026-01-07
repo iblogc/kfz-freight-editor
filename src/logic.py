@@ -13,10 +13,16 @@ class FreightBatchProcessor:
         self.api = None
         self.stop_requested = False
 
-    def log(self, message):
-        logger.info(message)
+    def log(self, message, level="INFO"):
+        if level == "INFO":
+            logger.info(message)
+        elif level == "WARNING":
+            logger.warning(message)
+        elif level == "ERROR":
+            logger.error(message)
+            
         if self.log_callback:
-            self.log_callback(message)
+            self.log_callback(message, level)
 
     def stop(self):
         self.stop_requested = True
@@ -44,21 +50,28 @@ class FreightBatchProcessor:
 
     def run(self, template_path, username, password):
         self.stop_requested = False
-        timestamp_dir = datetime.now().strftime('%Y%m%d%H%M%S')
+        start_time = datetime.now()
+        
+        # 确保 output 目录存在
+        if not os.path.exists("output"):
+            os.makedirs("output")
+            
+        timestamp_dir = os.path.join("output", start_time.strftime('%Y%m%d%H%M%S'))
         os.makedirs(timestamp_dir, exist_ok=True)
         
-        self.log(f"任务开始，输出目录: {timestamp_dir}")
+        self.log(f"任务开始，账号: {username}")
+        self.log(f"输出目录: {timestamp_dir}")
 
         # 1. 校验模板
         valid, template_data = self.validate_template_csv(template_path)
         if not valid:
-            self.log(f"模板校验失败: {template_data}")
+            self.log(f"模板校验失败: {template_data}", "ERROR")
             return
 
         # 2. 登录
         success, msg = self.login_manager.login(username, password)
         if not success:
-            self.log(f"登录失败: {msg}")
+            self.log(f"登录失败: {msg}", "ERROR")
             return
         
         self.api = KfzClient(self.login_manager.session)
@@ -66,7 +79,7 @@ class FreightBatchProcessor:
         # 3. 获取并校验运费模板配置
         success, config = self.api.get_base_select_data()
         if not success:
-            self.log(f"获取运费模板配置失败: {config}")
+            self.log(f"获取运费模板配置失败: {config}", "ERROR")
             return
         
         mould_list = config.get("mouldList", [])
@@ -76,11 +89,12 @@ class FreightBatchProcessor:
         for row in template_data:
             t_name = row['运费模板名字']
             if t_name not in mould_map:
-                self.log(f"错误: 运费模板 '{t_name}' 不存在于当前店铺配置中。")
+                self.log(f"错误: 运费模板 '{t_name}' 不存在于当前店铺配置中。", "ERROR")
                 return
         
         total_summary = {"success": 0, "fail": 0}
         generated_files = []
+        job_stats = [] # 用于最后生成表格
 
         # 4. 获取商品列表并保存 CSV
         for row in template_data:
@@ -101,7 +115,7 @@ class FreightBatchProcessor:
             while not self.stop_requested:
                 success, res = self.api.get_unsold_list(price_min, price_max, page=page)
                 if not success:
-                    self.log(f"获取商品列表失败 (page {page}): {res}")
+                    self.log(f"获取商品列表失败 (page {page}): {res}", "ERROR")
                     break
                 
                 page_data = res.get("productInfoPageResult", {})
@@ -121,27 +135,34 @@ class FreightBatchProcessor:
             if items:
                 # 保存为 CSV
                 fields = ['itemId', 'itemSn', 'name', 'qualityName', 'quality', 'price', 
-                          'realPrice', 'mouldId', 'mouldName', 'weight', 'result'] # 添加 result 列预留
+                          'realPrice', 'mouldId', 'mouldName', 'weight', 'result']
                 try:
                     with open(filepath, 'w', encoding='utf-8-sig', newline='') as f:
                         writer = csv.DictWriter(f, fieldnames=fields)
                         writer.writeheader()
                         for item in items:
-                            # 提取需要的字段，如果不在这里，赋空值
                             row_data = {k: item.get(k, '') for k in fields if k != 'result'}
-                            # 确保 weight 存在, API 可能返回 weightPiece 或 weight? 接口文档说 itemUint
-                            # 接口返回里 result->productInfoPageResult->list->item->weight
                             writer.writerow(row_data)
                     
                     generated_files.append({"path": filepath, "mould_id": mould_id, "count": len(items)})
+                    job_stats.append({
+                        "range": f"{price_min}-{price_max}",
+                        "mould": t_name,
+                        "count": len(items)
+                    })
                     self.log(f"  保存文件: {filename} (共 {len(items)} 条)")
                 except Exception as e:
-                    self.log(f"保存 CSV 失败: {e}")
+                    self.log(f"保存 CSV 失败: {e}", "ERROR")
             else:
-                self.log(f"  该区间无商品。")
+                self.log(f"  该区间无商品。", "WARNING")
+                job_stats.append({
+                    "range": f"{price_min}-{price_max}",
+                    "mould": t_name,
+                    "count": 0
+                })
 
         if self.stop_requested:
-            self.log("任务已停止。")
+            self.log("任务已停止。", "WARNING")
             return
 
         # 5. 批量修改
@@ -163,7 +184,6 @@ class FreightBatchProcessor:
             if not all_items:
                 continue
                 
-            # 分批处理
             batch_size = 200
             updated_items = []
             
@@ -172,53 +192,31 @@ class FreightBatchProcessor:
                 
                 batch = all_items[i:i+batch_size]
                 item_ids = [int(item['itemId']) for item in batch]
-                # 假设使用 batch 中第一个商品的 weight，或者既然批量也没法单独设置，就用一个。
-                # 实际上 API 如果每个商品 weight 不同，批量设置可能会覆盖 weight。
-                # 这里的逻辑假设 weight 不变或者我们只取第一个。
-                # 更加稳妥的是：如果 API 要求 weight, 我们尽量传 0.5 或者取众数？
-                # 接口文档 "value":"943965","itemUnit":"0.5"
-                # 暂时默认 0.5
-                # weight = batch[0].get('weight', '0.5')
-                # if not weight: weight = '0.5'
                 weight = '0.5'
                 success, res = self.api.batch_update_freight(item_ids, mould_id, weight)
                 
-                batch_result_msg = "未知结果"
-                success_ids = []
-                fail_ids = []
-                
                 if success:
-                    success_ids = res.get('successIds', []) # API 返回的是 string list 吗？
-                    # 接口文档: "successIds": ["8873035567"]
-                    success_ids = [str(x) for x in success_ids]
+                    success_ids = [str(x) for x in res.get('successIds', [])]
                     fail_ids = res.get('failIds', [])
                     batch_result_msg = res.get('message', '成功')
-                    
-                    # 更新统计
                     total_summary['success'] += len(success_ids)
-                    total_summary['fail'] += len(fail_ids) # 或者 len(item_ids) - len(success_ids)
+                    total_summary['fail'] += len(fail_ids)
+                    self.log(f"  批次 {i//batch_size + 1}: {batch_result_msg}")
                 else:
                     batch_result_msg = f"API调用失败: {res}"
-                    # 全失败
                     total_summary['fail'] += len(item_ids)
+                    self.log(f"  批次 {i//batch_size + 1}: {batch_result_msg}", "ERROR")
 
-                self.log(f"  批次 {i//batch_size + 1}: {batch_result_msg}")
-                
-                # 更新这一批 item 的 result 字段
                 for item in batch:
                     iid = str(item['itemId'])
                     if success:
-                        if iid in success_ids:
-                            item['result'] = '成功'
-                        else:
-                            item['result'] = '失败'
+                        item['result'] = '成功' if iid in success_ids else '失败'
                     else:
                         item['result'] = batch_result_msg
                     updated_items.append(item)
                 
                 time.sleep(1)
 
-            # 写回 CSV (带结果)
             if updated_items:
                 fieldnames = list(updated_items[0].keys())
                 with open(filepath, 'w', encoding='utf-8-sig', newline='') as f:
@@ -227,14 +225,31 @@ class FreightBatchProcessor:
                     writer.writerows(updated_items)
 
         # 6. 汇总结果
+        end_time = datetime.now()
+        duration = end_time - start_time
+        
         summary_file = os.path.join(timestamp_dir, "结果.txt")
-        summary_content = f"""任务完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-总成功: {total_summary['success']}
-总失败: {total_summary['fail']}
-结果输出目录: {timestamp_dir}
-"""
+        
+        lines = []
+        lines.append("="*40)
+        lines.append(f"任务执行摘要")
+        lines.append("="*40)
+        lines.append(f"账号: {username}")
+        lines.append(f"开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"总耗时: {str(duration).split('.')[0]}")
+        lines.append(f"成功总数: {total_summary['success']}")
+        lines.append(f"失败总数: {total_summary['fail']}")
+        lines.append("-" * 40)
+        lines.append("价格模板详情:")
+        for s in job_stats:
+            lines.append(f"- [{s['range']}] {s['mould']}: {s['count']} 条")
+        lines.append("=" * 40)
+        
+        summary_content = "\n".join(lines)
+        
         with open(summary_file, 'w', encoding='utf-8') as f:
             f.write(summary_content)
         
         self.log("任务全部完成。")
-        self.log(summary_content)
+        self.log(f"\n{summary_content}")
