@@ -1,0 +1,10 @@
+[project]
+name = "kfz-freight-editor"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "nuitka>=2.8.9",
+    "requests",
+]
