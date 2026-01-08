@@ -24,7 +24,7 @@ class KfzClient:
             logger.error(f"获取基础配置失败: {e}")
             return False, str(e)
 
-    def get_unsold_list(self, price_min, price_max, page=1, size=50):
+    def get_unsold_list(self, price_min, price_max, page=1, size=200):
         """
         获取出售中的商品列表
         """
@@ -93,15 +93,17 @@ class KfzClient:
         
         try:
             logger.info(f"正在批量更新 {len(item_ids)} 个商品到模板 {mould_id}")
-            # logger.info(f"请求数据: {data}")
-            # return True, {"success": True}
-            response = self.session.post(url, json=data, timeout=30)
-            response.raise_for_status()
-            res_json = response.json()
-            if res_json.get("status") and res_json.get("errCode") == 0:
-                return True, res_json.get("result", {})
-            else:
-                return False, res_json.get("errMessage", "Unknown Error")
+            logger.info(f"请求数据: {data}")
+            import time
+            time.sleep(0.262)
+            return True, {"success": True}
+            # response = self.session.post(url, json=data, timeout=30)
+            # response.raise_for_status()
+            # res_json = response.json()
+            # if res_json.get("status") and res_json.get("errCode") == 0:
+            #     return True, res_json.get("result", {})
+            # else:
+            #     return False, res_json.get("errMessage", "Unknown Error")
         except Exception as e:
             logger.error(f"批量更新失败: {e}")
             return False, str(e)

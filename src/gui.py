@@ -133,6 +133,22 @@ class MainWindow:
         if not success:
             messagebox.showerror("错误", f"无法打开目录: {msg}")
 
+    def set_ui_state(self, state):
+        """控制界面交互元素的可用性"""
+        self.btn_start.config(state=state)
+        # 不要控制 btn_stop，因为它有自己的逻辑
+        # 禁用输入框和浏览按钮
+        # 遍历所有子组件寻找 Entry 和 Button
+        def toggle_widgets(container):
+            for child in container.winfo_children():
+                if isinstance(child, (ttk.Entry, ttk.Button)):
+                    if child not in (self.btn_stop, self.btn_open_output, self.btn_open_logs):
+                        child.config(state=state)
+                elif child.winfo_children():
+                    toggle_widgets(child)
+        
+        toggle_widgets(self.root)
+
     def start_task(self):
         csv_file = self.csv_path.get()
         user = self.username.get()
@@ -146,7 +162,7 @@ class MainWindow:
             return
             
         self.is_running = True
-        self.btn_start.config(state="disabled")
+        self.set_ui_state("disabled")
         self.btn_stop.config(state="normal")
         self.txt_log.delete(1.0, "end") # 清空日志
         
@@ -172,6 +188,6 @@ class MainWindow:
             self.root.after(0, self.task_finished)
 
     def task_finished(self):
-        self.btn_start.config(state="normal")
+        self.set_ui_state("normal")
         self.btn_stop.config(state="disabled")
         messagebox.showinfo("完成", "任务运行完成，请查看界面运行日志，注意红色错误信息。")

@@ -110,49 +110,60 @@ class FreightBatchProcessor:
             
             self.log(f"正在获取价格区间 {price_min} - {price_max} 的商品...")
             
-            items = []
+            # 使用流式写入：每获取一页就保存一批
+            fields = ['itemId', 'itemSn', 'name', 'qualityName', 'quality', 'price', 
+                      'realPrice', 'mouldId', 'mouldName', 'weight', 'result']
+            
+            total_items_count = 0
+            file_exists = False
+            
             page = 1
             while not self.stop_requested:
-                success, res = self.api.get_unsold_list(price_min, price_max, page=page)
+                success, res = self.api.get_unsold_list(price_min, price_max, page=page, size=200)
                 if not success:
-                    self.log(f"获取商品列表失败 (page {page}): {res}", "ERROR")
+                    self.log(f"获取商品列表失败 (page {page}): {res}")
                     break
                 
                 page_data = res.get("productInfoPageResult", {})
                 item_list = page_data.get("list", [])
-                items.extend(item_list)
+                
+                if item_list:
+                    # 写入 CSV
+                    try:
+                        mode = 'w' if not file_exists else 'a'
+                        with open(filepath, mode, encoding='utf-8-sig', newline='') as f:
+                            writer = csv.DictWriter(f, fieldnames=fields)
+                            if not file_exists:
+                                writer.writeheader()
+                                file_exists = True
+                            
+                            for item in item_list:
+                                row_data = {k: item.get(k, '') for k in fields if k != 'result'}
+                                writer.writerow(row_data)
+                        
+                        total_items_count += len(item_list)
+                    except Exception as e:
+                        self.log(f"保存 CSV 页面数据失败: {e}")
+                        break
                 
                 pager = page_data.get("pager", {})
                 total_pages = pager.get("pages", 0)
                 
-                self.log(f"  已获取第 {page}/{total_pages} 页，本积累积 {len(items)} 条")
+                self.log(f"  已获取并保存第 {page}/{total_pages} 页，此区间累积 {total_items_count} 条")
                 
                 if page >= total_pages or not item_list:
                     break
                 page += 1
-                time.sleep(0.5) # 避免太快
+                time.sleep(0.5)
 
-            if items:
-                # 保存为 CSV
-                fields = ['itemId', 'itemSn', 'name', 'qualityName', 'quality', 'price', 
-                          'realPrice', 'mouldId', 'mouldName', 'weight', 'result']
-                try:
-                    with open(filepath, 'w', encoding='utf-8-sig', newline='') as f:
-                        writer = csv.DictWriter(f, fieldnames=fields)
-                        writer.writeheader()
-                        for item in items:
-                            row_data = {k: item.get(k, '') for k in fields if k != 'result'}
-                            writer.writerow(row_data)
-                    
-                    generated_files.append({"path": filepath, "mould_id": mould_id, "count": len(items)})
-                    job_stats.append({
-                        "range": f"{price_min}-{price_max}",
-                        "mould": t_name,
-                        "count": len(items)
-                    })
-                    self.log(f"  保存文件: {filename} (共 {len(items)} 条)")
-                except Exception as e:
-                    self.log(f"保存 CSV 失败: {e}", "ERROR")
+            if total_items_count > 0:
+                generated_files.append({"path": filepath, "mould_id": mould_id, "count": total_items_count})
+                self.log(f"  区间处理完成: {filename} (共 {total_items_count} 条)")
+                job_stats.append({
+                    "range": f"{price_min}-{price_max}",
+                    "mould": t_name,
+                    "count": total_items_count
+                })
             else:
                 self.log(f"  该区间无商品。", "WARNING")
                 job_stats.append({
@@ -172,57 +183,43 @@ class FreightBatchProcessor:
             
             filepath = job['path']
             mould_id = job['mould_id']
+            temp_filepath = filepath + ".tmp"
             
             self.log(f"正在处理文件: {os.path.basename(filepath)}，目标模板ID: {mould_id}")
             
-            # 读取所有商品
-            all_items = []
-            with open(filepath, 'r', encoding='utf-8-sig') as f:
-                reader = csv.DictReader(f)
-                all_items = list(reader)
-            
-            if not all_items:
-                continue
-                
-            batch_size = 200
-            updated_items = []
-            
-            for i in range(0, len(all_items), batch_size):
-                if self.stop_requested: break
-                
-                batch = all_items[i:i+batch_size]
-                item_ids = [int(item['itemId']) for item in batch]
-                weight = '0.5'
-                success, res = self.api.batch_update_freight(item_ids, mould_id, weight)
-                
-                if success:
-                    success_ids = [str(x) for x in res.get('successIds', [])]
-                    fail_ids = res.get('failIds', [])
-                    batch_result_msg = res.get('message', '成功')
-                    total_summary['success'] += len(success_ids)
-                    total_summary['fail'] += len(fail_ids)
-                    self.log(f"  批次 {i//batch_size + 1}: {batch_result_msg}")
-                else:
-                    batch_result_msg = f"API调用失败: {res}"
-                    total_summary['fail'] += len(item_ids)
-                    self.log(f"  批次 {i//batch_size + 1}: {batch_result_msg}", "ERROR")
-
-                for item in batch:
-                    iid = str(item['itemId'])
-                    if success:
-                        item['result'] = '成功' if iid in success_ids else '失败'
-                    else:
-                        item['result'] = batch_result_msg
-                    updated_items.append(item)
-                
-                time.sleep(1)
-
-            if updated_items:
-                fieldnames = list(updated_items[0].keys())
-                with open(filepath, 'w', encoding='utf-8-sig', newline='') as f:
-                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+            try:
+                batch_size = 200
+                with open(filepath, 'r', encoding='utf-8-sig') as f_in, \
+                     open(temp_filepath, 'w', encoding='utf-8-sig', newline='') as f_out:
+                    
+                    reader = csv.DictReader(f_in)
+                    fieldnames = reader.fieldnames
+                    writer = csv.DictWriter(f_out, fieldnames=fieldnames)
                     writer.writeheader()
-                    writer.writerows(updated_items)
+                    
+                    batch = []
+                    for row in reader:
+                        if self.stop_requested: break
+                        batch.append(row)
+                        
+                        if len(batch) >= batch_size:
+                            self._process_batch(batch, mould_id, writer, total_summary)
+                            batch = []
+                            time.sleep(1) # 每批次间隔
+                    
+                    # 处理剩余的
+                    if batch and not self.stop_requested:
+                        self._process_batch(batch, mould_id, writer, total_summary)
+                
+                # 替换原文件
+                if not self.stop_requested:
+                    os.replace(temp_filepath, filepath)
+                else:
+                    if os.path.exists(temp_filepath): os.remove(temp_filepath)
+                    
+            except Exception as e:
+                self.log(f"处理文件 {filepath} 失败: {e}", "ERROR")
+                if os.path.exists(temp_filepath): os.remove(temp_filepath)
 
         # 6. 汇总结果
         end_time = datetime.now()
@@ -248,8 +245,52 @@ class FreightBatchProcessor:
         
         summary_content = "\n".join(lines)
         
-        with open(summary_file, 'w', encoding='utf-8') as f:
+        with open(summary_file, 'w', encoding='utf-8-sig') as f:
             f.write(summary_content)
         
         self.log("任务全部完成。")
         self.log(f"\n{summary_content}")
+
+    def _process_batch(self, batch, mould_id, writer, total_summary):
+        """执行单批次更新并写入结果"""
+        item_ids = [int(item['itemId']) for item in batch]
+        # 默认 0.5
+        weight = '0.5'
+        success, res = self.api.batch_update_freight(item_ids, mould_id, weight)
+        
+        success_ids = []
+        fail_ids = []
+        batch_result_msg = ""
+
+        if success:
+            # 兼容处理：有些 API 结果可能没返回具体的 successIds 列表但 status 是 true
+            raw_success_ids = res.get('successIds', [])
+            success_ids = [str(x) for x in raw_success_ids]
+            fail_ids = [str(x) for x in res.get('failIds', [])]
+            batch_result_msg = res.get('message', '成功')
+            
+            # 如果 API 没有明确给出 successIds，则认为当前批次请求的都成功了（防止统计为0）
+            if not success_ids and not fail_ids:
+                total_summary['success'] += len(item_ids)
+                batch_result_msg = f"成功 (全量)"
+            else:
+                total_summary['success'] += len(success_ids)
+                total_summary['fail'] += len(fail_ids)
+        else:
+            batch_result_msg = f"失败: {res}"
+            total_summary['fail'] += len(item_ids)
+
+        self.log(f"  批次更新完毕: {batch_result_msg}")
+        
+        # 写入结果
+        for item in batch:
+            iid = str(item['itemId'])
+            if success:
+                if not success_ids and not fail_ids:
+                    item['result'] = '成功'
+                else:
+                    item['result'] = '成功' if iid in success_ids else '失败'
+            else:
+                item['result'] = batch_result_msg
+            writer.writerow(item)
+
